@@ -6,6 +6,6 @@ C 端组件：主动外连 B 端 AstrBot 插件的 WebSocket 服务，接收指�
 
 # 版本号单一来源：其余模块（executor / ws_client / 打包脚本）一律从此处读取，
 # 避免出现多处硬编码版本不一致。
-__version__ = "1.7.0"
+__version__ = "1.7.5"
 
 __all__ = ["__version__"]

@@ -14,7 +14,7 @@
 > **⚠️ 来源声明**：本仓库是原作者 [@silver-wolf-little-wife](https://github.com/silver-wolf-little-wife) 的 **Cherry Remote**（[cherry-astrbot](https://github.com/silver-wolf-little-wife/cherry-astrbot) / [cherry-remote-app](https://github.com/silver-wolf-little-wife/cherry-remote-app)）的改名延续版（WinRemote），由 [@183kugua](https://github.com/183kugua) 维护。原作者享有原始作品的全功劳，本项目遵循原开源协议（MIT）。
 
 
-WinRemote 远程操控系统 · **C 端执行器**。当前版本 **v1.6.2**。
+WinRemote 远程操控系统 · **C 端执行器**。当前版本 **v1.7.5**。
 
 部署在目标电脑（C地·家庭局域网内 PC）上的常驻服务，**纯执行器，无任何 AI/LLM 逻辑**。
 
@@ -112,7 +112,7 @@ python test_file_pull.py   # file_pull：握手/单帧/流式分块 sha256/缺�
 python test_smoke.py       # Executor 全方法冒烟：exec/sys/ping/file/app/screenshot/system/白名单
 python test_exe_index.py   # exe 索引：版本资源读取/显示名回退链/索引 JSON/显示名解析/app search/旧索引合并
 python test_gui.py         # gui 键鼠：按键名/字符映射/shift 符号/Unicode 中文路由/input/keys/mouse 执行器转发（mock 底层）
-python test_v162.py        # v1.6.2 新能力：剪贴板、点击自动激活窗口、截图复用缓存、版本号单一来源
+python test_features.py    # 专项功能测试：剪贴板、点击自动激活窗口、截图复用缓存
 python test_gui_console.py # 图形控制台：daemon 启停/重启/进程识别逻辑（无界面环境可跑）
 ```
 
