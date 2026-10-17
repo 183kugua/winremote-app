@@ -1,0 +1,59 @@
+# WinRemote App 配置样例
+# 复制为 config.yaml 并按需修改
+
+# B 端 AstrBot 插件的 WebSocket 地址（wss 时用 wss://）
+server_url: "ws://127.0.0.1:8765/ws"
+
+# 认证 token（必须与 B 端插件配置一致）
+auth_token: "change-me"
+
+# wss/TLS：server_url 用 wss:// 时生效
+# ssl_verify: true 校验证书（推荐）；自签名证书可设 false
+# ca_cert: 自定义 CA 证书路径（可选）
+ssl_verify: true
+ca_cert: ""
+
+# 本机设备标识（多设备时用于区分）
+device_id: "home-pc"
+
+# 心跳间隔（秒），主动向 B 端发送 ping
+heartbeat_interval: 15
+
+# 断线最大重连间隔（秒），指数退避到该上限
+max_reconnect_delay: 60
+
+# 指令执行默认超时（秒）
+default_timeout: 30
+
+# 启动时是否构建 exe 索引（供 app 工具查找/搜索应用）
+# 索引含两层：文件名(小写)->路径；产品名/文件说明(小写)->[{file,path}]，
+# 支持按用户认知的应用名查找（如“米哈游启动器”-> HYP.exe）
+build_exe_index: true
+
+# exe 索引文件路径（相对启动目录）；格式 v2：文件名映射 + _product 显示名映射 + _meta
+exe_index_file: "exe_index.json"
+
+# 单次文件拉取大小上限（字节），超过 pull_threshold 的文件走流式分块传输
+max_pull_size: 209715200
+
+# 指令白名单（仅允许执行以下 method）
+# exec=shell  file=文件操作  app=应用启停  sys=系统信息  screenshot=截屏  ping=连通性
+# file_pull=流式文件拉取  system=急停/状态
+# input=键盘输入文字  keys=敲击按键/组合键  mouse=鼠标点击/移动/滚动/拖拽
+# clipboard=读写系统剪贴板
+allowed_actions:
+  - exec
+  - sys
+  - ping
+  - file
+  - file_pull
+  - app
+  - screenshot
+  - system
+  - input
+  - keys
+  - mouse
+  - clipboard
+
+# 急停开关：置 true 后拒绝执行一切指令（本地熔断）
+emergency_stop: false

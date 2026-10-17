@@ -1,0 +1,1034 @@
+"""指令执行器（纯执行，无判断）。
+
+每个 method 对应一个 `_exec_<method>` 异步方法，返回可 JSON 序列化的 dict。
+指令白名单在构造时从配置注入。
+"""
+
+import asyncio
+import base64
+import json
+import locale
+import logging
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import psutil
+
+from . import __version__
+
+try:
+    from . import gui
+except Exception:  # pragma: no cover —— 非 Windows 等环境降级
+    gui = None
+
+LOG = logging.getLogger("winremote-app.executor")
+
+# exe 索引默认扫描根目录（旧版，已由 _index_roots 枚举所有磁盘替代）
+_EXE_INDEX_ROOTS = (
+    r"C:\Windows\System32",
+    r"C:\Windows\SysWOW64",
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
+)
+
+# exec 输出单通道截断上限（字符），防止超大输出撑爆 WebSocket 消息
+_MAX_OUTPUT_LEN = 64 * 1024
+
+# exe 索引条目上限（文件名索引）
+_EXE_INDEX_LIMIT = 8000
+# 显示名别名索引上限（产品名/文件说明）
+_PRODUCT_INDEX_LIMIT = 4000
+# 单个别名最多对应的路径数，防止“Microsoft® Windows® Operating System”这类通用名占满索引
+_PRODUCT_PATHS_LIMIT = 8
+# 无区分度的通用产品名黑名单（小写），不进入显示名别名索引
+_GENERIC_PRODUCT_NAMES = frozenset({"microsoft® windows® operating system"})
+
+# 会改变屏幕内容的指令：执行后使截图复用缓存失效，避免后续拿到过期画面
+_SCREEN_MUTATING_METHODS = frozenset({"mouse", "input", "keys", "clipboard", "app"})
+
+
+def _normalize_alias(value: str) -> str:
+    """规范化显示名别名：去首尾空白、压缩连续空白、转小写（与文件名索引保持一致）。"""
+    return " ".join(value.strip().lower().split())
+
+
+def _read_exe_version_info(path: str) -> dict[str, str] | None:
+    """读取 PE 版本资源（产品名称/文件说明等），供显示名索引使用。
+
+    纯 ctypes 实现（调用 Windows version.dll），无第三方依赖；
+    非 Windows、无版本资源或读取失败时返回 None。
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ver = ctypes.WinDLL("version", use_last_error=True)
+        size = ver.GetFileVersionInfoSizeW(ctypes.c_wchar_p(path), None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(ctypes.c_wchar_p(path), 0, size, buf):
+            return None
+
+        def _query(subblock: str) -> str | None:
+            ptr = ctypes.c_void_p()
+            length = wintypes.DWORD()
+            if not ver.VerQueryValueW(buf, subblock, ctypes.byref(ptr), ctypes.byref(length)):
+                return None
+            value = ctypes.cast(ptr, ctypes.c_wchar_p).value
+            return value.strip() if value else None
+
+        # 翻译表决定 StringFileInfo 的语言/代码页段（如 040904B0），可能有多段
+        ptr = ctypes.c_void_p()
+        length = wintypes.DWORD()
+        if not ver.VerQueryValueW(buf, r"\VarFileInfo\Translation", ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        words = ctypes.cast(ptr, ctypes.POINTER(wintypes.WORD))
+        fields = (
+            "ProductName",
+            "FileDescription",
+            "CompanyName",
+            "FileVersion",
+            "ProductVersion",
+            "OriginalFilename",
+            "InternalName",
+            "LegalCopyright",
+        )
+        info: dict[str, str] = {}
+        for i in range(length.value // 4):
+            lang, codepage = words[2 * i], words[2 * i + 1]
+            prefix = f"\\StringFileInfo\\{lang:04X}{codepage:04X}"
+            for field in fields:
+                if field in info:
+                    continue
+                value = _query(f"{prefix}\\{field}")
+                if value:
+                    info[field] = value
+        return info or None
+    except Exception:
+        return None
+
+
+def _decode_output(data: bytes) -> str:
+    """解码子进程输出。
+
+    Windows 控制台命令（ping/dir 等）按系统 ANSI 代码页输出（中文系统为 GBK），
+    若硬按 UTF-8 解码会产生乱码。此处 Windows 优先用 locale 编码，其他平台用 UTF-8。
+    """
+    if not data:
+        return ""
+    if os.name == "nt":
+        enc = locale.getpreferredencoding(False) or "utf-8"
+    else:
+        enc = "utf-8"
+    try:
+        return data.decode(enc)
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def _cap_text(text: str, limit: int = _MAX_OUTPUT_LEN) -> tuple[str, bool]:
+    """超长输出截断，返回 (文本, 是否截断)。"""
+    if len(text) <= limit:
+        return text, False
+    return text[:limit] + "\n...[输出已截断]", True
+
+
+class Executor:
+    def __init__(self, config: dict):
+        self.allowed_actions: set[str] = set(
+            config.get("allowed_actions", ["exec", "sys", "ping", "file", "file_pull", "app", "screenshot", "system", "input", "keys", "mouse", "clipboard"])
+        )
+        self.default_timeout: float = float(config.get("default_timeout", 30))
+        # 单次拉取文件大小上限（字节），默认 200MB
+        self.max_pull_size: int = int(config.get("max_pull_size", 200 * 1024 * 1024))
+        self.device_id: str = str(config.get("device_id", "unknown"))
+        # 急停开关：置 true 后拒绝执行一切指令
+        self.emergency_stop: bool = bool(config.get("emergency_stop", False))
+        self.shutdown_requested: bool = False
+        self._start_time: float = time.time()
+        # exe 索引
+        self.build_exe_index: bool = bool(config.get("build_exe_index", True))
+        self.exe_index_file: str = str(config.get("exe_index_file", "exe_index.json"))
+        # 文件名(小写) -> 完整路径
+        self.exe_index: dict[str, str] = {}
+        # 显示名别名索引：产品名/文件说明(小写) -> [完整路径, ...]
+        # 解决“exe 文件名与用户认知的应用名不一致”（如 HYP.exe 的产品名是“米哈游启动器”）
+        self.exe_product_index: dict[str, list[str]] = {}
+        self._index_task: asyncio.Task | None = None
+        # 截图复用缓存：(抓取时间戳, 截图结果字典)；供短时间内重复截图直接复用
+        self._last_shot: tuple[float, dict] | None = None
+
+    async def execute(self, method: str, params: dict, send_frame=None) -> dict:
+        """执行一条指令。method 不在白名单或未实现时抛异常。
+
+        send_frame：可选回调，流式方法（file_pull）用它向 B 端分块推送数据帧。
+        """
+        if self.emergency_stop:
+            raise PermissionError("紧急停机已启用（emergency_stop），拒绝执行所有指令")
+        if method not in self.allowed_actions:
+            raise PermissionError(f"action '{method}' 不在白名单内")
+        handler = getattr(self, f"_exec_{method}", None)
+        if handler is None:
+            raise NotImplementedError(f"method '{method}' 未实现")
+        if send_frame is not None:
+            return await handler(params or {}, send_frame)
+        if method == "file_pull":
+            raise RuntimeError("file_pull 必须经流式通道调用（缺少 send_frame 回调）")
+        result = await handler(params or {})
+        if method in _SCREEN_MUTATING_METHODS:
+            # 画面已改变：让下一次 screenshot 抓新图，而不是命中复用缓存
+            self._last_shot = None
+        return result
+
+    # ---------- system 方法（急停/状态） ----------
+
+    async def _exec_system(self, params: dict) -> dict:
+        action = params.get("action", "status")
+        if action == "status":
+            return {
+                "status": "ok",
+                "version": __version__,
+                "device_id": self.device_id,
+                "pid": os.getpid(),
+                "uptime": round(time.time() - self._start_time, 1),
+                "emergency_stop": self.emergency_stop,
+                "exe_index_entries": len(self.exe_index),
+                "exe_product_entries": len(self.exe_product_index),
+                "allowed_actions": sorted(self.allowed_actions),
+            }
+        if action == "stop":
+            self.shutdown_requested = True
+            return {"ok": True, "action": "stop", "shutdown": True}
+        raise NotImplementedError(f"system action '{action}' 未实现")
+
+    # ---------- method 实现 ----------
+
+    async def _exec_ping(self, params: dict) -> dict:
+        return {"pong": True}
+
+    async def _exec_exec(self, params: dict) -> dict:
+        """执行 shell 命令。"""
+        command = params.get("command")
+        if not command or not isinstance(command, str):
+            raise ValueError("params.command 必填且为字符串")
+        timeout = float(params.get("timeout", self.default_timeout))
+        cwd = params.get("cwd")
+        env = dict(os.environ)
+        env.update({k: str(v) for k, v in (params.get("env") or {}).items()})
+
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        start = time.monotonic()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            timed_out = False
+        except asyncio.TimeoutError:
+            proc.kill()
+            stdout, stderr = await proc.communicate()
+            timed_out = True
+        elapsed = round(time.monotonic() - start, 3)
+
+        out_text, out_truncated = _cap_text(_decode_output(stdout))
+        err_text, err_truncated = _cap_text(_decode_output(stderr))
+        return {
+            "stdout": out_text,
+            "stderr": err_text,
+            "exit_code": proc.returncode,
+            "timed_out": timed_out,
+            "truncated": out_truncated or err_truncated,
+            "elapsed": elapsed,
+        }
+
+    async def _exec_sys(self, params: dict) -> dict:
+        """采集系统信息（psutil）。"""
+        import platform
+
+        import psutil
+
+        vm = psutil.virtual_memory()
+        disks = []
+        for part in psutil.disk_partitions(all=False):
+            try:
+                usage = psutil.disk_usage(part.mountpoint)
+            except Exception:
+                continue
+            disks.append(
+                {
+                    "mount": part.mountpoint,
+                    "device": part.device,
+                    "total": usage.total,
+                    "used": usage.used,
+                    "percent": usage.percent,
+                }
+            )
+
+        cpu_freq = None
+        try:
+            freq = psutil.cpu_freq()
+            if freq:
+                cpu_freq = {"current": freq.current, "max": freq.max, "min": freq.min}
+        except Exception:
+            pass
+
+        return {
+            "hostname": platform.node(),
+            "os": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "cpu": {
+                "percent": psutil.cpu_percent(interval=0.3),
+                "count": psutil.cpu_count(logical=True),
+                "freq": cpu_freq,
+            },
+            "memory": {
+                "total": vm.total,
+                "available": vm.available,
+                "used": vm.used,
+                "percent": vm.percent,
+            },
+            "disk": disks,
+            "boot_time": psutil.boot_time(),
+        }
+
+    # ---------- file 方法 ----------
+
+    async def _exec_file(self, params: dict) -> dict:
+        action = params.get("action")
+        if not params.get("path"):
+            raise ValueError("params.path 必填")
+        handler = getattr(self, f"_file_{action}", None)
+        if handler is None:
+            raise NotImplementedError(f"file action '{action}' 未实现")
+        return await handler(params)
+
+    async def _file_list(self, params: dict) -> dict:
+        p = Path(params["path"])
+        if not p.exists():
+            raise FileNotFoundError(f"路径不存在: {p}")
+        recursive = bool(params.get("recursive", False))
+        iterator = p.rglob("*") if recursive else p.iterdir()
+        entries = []
+        for item in iterator:
+            try:
+                st = item.stat()
+            except OSError:
+                continue
+            entries.append(
+                {
+                    "name": item.name,
+                    "path": str(item),
+                    "type": "dir" if item.is_dir() else "file",
+                    "size": st.st_size if item.is_file() else 0,
+                    "mtime": st.st_mtime,
+                }
+            )
+        entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+        return {"path": str(p), "count": len(entries), "entries": entries}
+
+    async def _file_read(self, params: dict) -> dict:
+        p = Path(params["path"])
+        if not p.is_file():
+            raise FileNotFoundError(f"文件不存在: {p}")
+        data = p.read_bytes()
+        for enc in ("utf-8", locale.getpreferredencoding(False)):
+            try:
+                text = data.decode(enc)
+                return {"path": str(p), "encoding": enc, "size": len(data), "content": text}
+            except UnicodeDecodeError:
+                continue
+        return {
+            "path": str(p),
+            "encoding": "base64",
+            "size": len(data),
+            "content": base64.b64encode(data).decode("ascii"),
+        }
+
+    async def _file_write(self, params: dict) -> dict:
+        p = Path(params["path"])
+        content = params.get("content", "")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if params.get("encoding") == "base64":
+            data = base64.b64decode(content)
+            p.write_bytes(data)
+            return {"path": str(p), "ok": True, "bytes": len(data)}
+        if isinstance(content, str):
+            p.write_text(content, encoding="utf-8")
+            return {"path": str(p), "ok": True, "bytes": len(content.encode("utf-8"))}
+        raise ValueError("params.content 必须为字符串或 base64")
+
+    async def _file_copy(self, params: dict) -> dict:
+        src, dest = params["path"], params.get("dest")
+        if not dest:
+            raise ValueError("params.dest 必填")
+        if Path(src).is_dir():
+            shutil.copytree(src, dest)
+        else:
+            shutil.copy2(src, dest)
+        return {"ok": True, "src": src, "dest": dest}
+
+    async def _file_delete(self, params: dict) -> dict:
+        p = Path(params["path"])
+        if not p.exists():
+            raise FileNotFoundError(f"路径不存在: {p}")
+        if p.is_dir():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+        return {"ok": True, "deleted": str(p)}
+
+    async def _file_info(self, params: dict) -> dict:
+        p = Path(params["path"])
+        if not p.exists():
+            raise FileNotFoundError(f"路径不存在: {p}")
+        st = p.stat()
+        return {
+            "path": str(p),
+            "type": "dir" if p.is_dir() else "file",
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "absolute": str(p.absolute()),
+        }
+
+    async def _exec_file_pull(self, params: dict, send_frame) -> dict:
+        """分块流式读取文件：逐块 base64 经 send_frame 推送 file_data 帧，返回元数据。
+
+        用于 B 端拉取大文件：数据帧直接落盘在 B 端，不经过 LLM 上下文。
+        """
+        import hashlib
+
+        p = Path(params["path"])
+        if not p.is_file():
+            raise FileNotFoundError(f"文件不存在: {p}")
+        size = p.stat().st_size
+        if self.max_pull_size and size > self.max_pull_size:
+            raise ValueError(f"文件大小 {size} 超过 max_pull_size={self.max_pull_size}")
+        chunk_size = max(64 * 1024, int(params.get("chunk_size", 1024 * 1024)))
+        total = (size + chunk_size - 1) // chunk_size
+        sha = hashlib.sha256()
+        with open(p, "rb") as f:
+            for index in range(total):
+                data = f.read(chunk_size)
+                if not data:
+                    break
+                sha.update(data)
+                await send_frame(
+                    {
+                        "type": "file_data",
+                        "index": index,
+                        "total": total,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    }
+                )
+        return {
+            "path": str(p),
+            "name": p.name,
+            "size": size,
+            "chunks": total,
+            "sha256": sha.hexdigest(),
+        }
+
+    # ---------- exe 索引（后台构建） ----------
+
+    def start_background_tasks(self) -> None:
+        """启动后台任务（exe 索引构建等）。在事件循环中调用。"""
+        if self.build_exe_index and self._index_task is None:
+            self._index_task = asyncio.create_task(self._build_exe_index())
+
+    async def _build_exe_index(self) -> None:
+        """扫描常见目录生成 exe 索引并写入 exe_index.json。
+
+        两层索引：
+        1. 文件名(小写) -> 完整路径（原有，按文件名查找/启动）；
+        2. 产品名/文件说明(小写) -> [{file, path}]（新增，让“用户认知的应用名”
+           也能对应到文件位置与文件名，解决文件名与应用名不一致的问题）。
+
+        扫描在后台线程执行，避免阻塞事件循环（心跳/指令处理）。
+        """
+        try:
+            LOG.info("正在构建 exe 索引……")
+            index, product_index = await asyncio.to_thread(self._scan_exe_index)
+            self.exe_index = index
+            self.exe_product_index = product_index
+            payload: dict = dict(index)
+            payload["_product"] = {
+                alias: [{"file": os.path.basename(p), "path": p} for p in paths]
+                for alias, paths in sorted(product_index.items())
+            }
+            payload["_meta"] = {
+                "version": 2,
+                "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "exe_count": len(index),
+                "product_count": len(product_index),
+                "note": (
+                    "顶层键为 exe 文件名(小写)->完整路径；_product 为产品名称/文件说明(小写)->[{file,path}]，"
+                    "用于按用户认知的应用名查找。回退链：文件属性里的产品名称(ProductName)缺失或为空时，"
+                    "回退到文件说明(FileDescription)；两者皆无则仅保留文件名条目。"
+                ),
+            }
+            try:
+                Path(self.exe_index_file).write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+                )
+                LOG.info(
+                    f"exe 索引构建完成：{len(index)} 条文件名 + {len(product_index)} 条显示名 -> {self.exe_index_file}"
+                )
+            except Exception as e:
+                LOG.warning(f"exe 索引写入失败: {e}")
+        except Exception as e:
+            LOG.error(f"exe 索引构建失败: {e}")
+
+    def _scan_exe_index(self) -> tuple[dict[str, str], dict[str, list[str]]]:
+        """同步扫描，返回 (文件名索引, 显示名索引)。在后台线程中执行。"""
+        index: dict[str, str] = {}
+        product_index: dict[str, list[str]] = {}
+        count = 0
+        for root, max_depth in self._index_roots():
+            for exe_path in self._walk_exes(root, max_depth=max_depth):
+                key = os.path.basename(exe_path).lower()
+                if key not in index:
+                    index[key] = exe_path
+                    count += 1
+                self._index_product_aliases(exe_path, product_index)
+                if count >= _EXE_INDEX_LIMIT:
+                    break
+            if count >= _EXE_INDEX_LIMIT:
+                LOG.info("exe 索引已达上限 %d 条，停止扫描", _EXE_INDEX_LIMIT)
+                break
+        # 保留旧索引中仍有效的条目（历史手工添加、扫描范围外的路径），防止重启丢失
+        self._merge_legacy_index(index)
+        return index, product_index
+
+    def _index_product_aliases(self, exe_path: str, product_index: dict[str, list[str]]) -> None:
+        """把 exe 的产品名/文件说明加入显示名别名索引。
+
+        回退链：ProductName(产品名称) -> FileDescription(文件说明)。
+        - 字段不叫 ProductName / 字段为空 / 无版本资源：回退到文件说明；
+        - 两者都没有：跳过别名，文件名索引仍然兜底（app search 按文件名仍能找到）。
+        """
+        if len(product_index) >= _PRODUCT_INDEX_LIMIT:
+            return
+        info = _read_exe_version_info(exe_path)
+        if not info:
+            return
+        stem = os.path.splitext(os.path.basename(exe_path))[0].lower()
+        for value in (info.get("ProductName"), info.get("FileDescription")):
+            key = _normalize_alias(value) if value else ""
+            # 跳过：空值、与文件名重复（无补充价值）、通用无区分度产品名
+            if not key or key == stem or key in _GENERIC_PRODUCT_NAMES:
+                continue
+            paths = product_index.setdefault(key, [])
+            # 路径按大小写不敏感去重（Windows 路径大小写不敏感，如 system32/System32）
+            if any(os.path.normcase(p) == os.path.normcase(exe_path) for p in paths):
+                continue
+            if len(paths) < _PRODUCT_PATHS_LIMIT:
+                paths.append(exe_path)
+
+    def _merge_legacy_index(self, index: dict[str, str]) -> None:
+        """把旧版 exe_index.json 中仍有效（文件存在）的条目合并进新索引。"""
+        try:
+            old_path = Path(self.exe_index_file)
+            if not old_path.is_file():
+                return
+            old = json.loads(old_path.read_text(encoding="utf-8"))
+            if not isinstance(old, dict):
+                return
+            for key, value in old.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    continue  # 跳过 _product/_meta 等结构
+                if key.startswith("_") or key in index:
+                    continue
+                if os.path.isfile(value):
+                    index[key] = value
+        except Exception as e:
+            LOG.warning(f"合并旧版 exe 索引失败（忽略）: {e}")
+
+    def _index_roots(self) -> list[tuple[str, int]]:
+        """返回 (根目录, 最大递归深度) 列表。
+
+        覆盖：PATH、Windows 系统目录、所有磁盘的 Program Files、LOCALAPPDATA\\Programs。
+        """
+        roots: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        # PATH 目录
+        for p in os.environ.get("PATH", "").split(os.pathsep):
+            if p and os.path.isdir(p) and os.path.normpath(p) not in seen:
+                seen.add(os.path.normpath(p))
+                roots.append((p, 1))
+        # Windows 系统目录
+        for d in (r"C:\Windows\System32", r"C:\Windows\SysWOW64"):
+            if d and os.path.isdir(d) and os.path.normpath(d) not in seen:
+                seen.add(os.path.normpath(d))
+                roots.append((d, 1))
+        # 所有固定磁盘的 Program Files / Program Files (x86)
+        for drive in self._fixed_drives():
+            for sub in ("Program Files", "Program Files (x86)"):
+                d = os.path.join(drive, sub)
+                if os.path.isdir(d) and os.path.normpath(d) not in seen:
+                    seen.add(os.path.normpath(d))
+                    roots.append((d, 3))
+        # LOCALAPPDATA\Programs（许多按用户安装的应用）
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        programs_dir = os.path.join(local_appdata, "Programs")
+        if local_appdata and os.path.isdir(programs_dir):
+            roots.append((programs_dir, 3))
+        return roots
+
+    @staticmethod
+    def _fixed_drives() -> list[str]:
+        """枚举所有存在的磁盘盘符（C:、D:、E: …）。"""
+        import string
+
+        drives: list[str] = []
+        for letter in string.ascii_uppercase:
+            d = f"{letter}:\\"
+            if os.path.exists(d):
+                drives.append(d)
+        return drives
+
+    @staticmethod
+    def _walk_exes(root: str, max_depth: int = 3):
+        base_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            depth = dirpath.rstrip(os.sep).count(os.sep) - base_depth
+            if depth >= max_depth:
+                dirnames[:] = []
+            for fn in filenames:
+                if fn.lower().endswith(".exe"):
+                    yield os.path.join(dirpath, fn)
+
+    # ---------- app 方法 ----------
+
+    async def _exec_app(self, params: dict) -> dict:
+        action = params.get("action")
+        handler = getattr(self, f"_app_{action}", None)
+        if handler is None:
+            raise NotImplementedError(f"app action '{action}' 未实现")
+        return await handler(params)
+
+    async def _app_launch(self, params: dict) -> dict:
+        name = params.get("name")
+        if not name:
+            raise ValueError("params.name 必填")
+        args = [str(a) for a in (params.get("args") or [])]
+        cwd = params.get("cwd")
+        resolved = self._resolve_exe(name)
+        if resolved:
+            name = resolved
+        # .lnk 快捷方式不能用 Popen 直接启动，交给 os.startfile 解析
+        if name.lower().endswith(".lnk"):
+            if os.name == "nt":
+                os.startfile(name)
+                return {"ok": True, "launched": name, "note": "os.startfile(.lnk)"}
+            raise ValueError("仅 Windows 支持 .lnk 快捷方式")
+        try:
+            proc = subprocess.Popen(
+                [name, *args],
+                cwd=cwd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {"ok": True, "pid": proc.pid, "launched": name}
+        except FileNotFoundError:
+            if os.name == "nt":
+                os.startfile(name)
+                return {"ok": True, "launched": name, "note": "os.startfile"}
+            raise FileNotFoundError(f"未找到可启动的应用: {name}") from None
+        except OSError as e:
+            # Windows 740：需要管理员权限（"The requested operation requires elevation"）
+            if os.name == "nt" and getattr(e, "winerror", None) == 740:
+                return await self._launch_elevated(name, args, cwd)
+            raise
+
+    def _resolve_exe(self, name: str) -> str | None:
+        """把应用名解析为完整路径。
+
+        解析顺序：产品名/文件说明（用户认知的显示名，如“米哈游启动器”）->
+        exe 文件名 -> PATH。
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        if os.sep in name or "/" in name:
+            return None  # 本身就是路径
+        low = name.lower()
+        if not low.endswith(".exe"):
+            # 先按显示名（产品名/文件说明）匹配，解决文件名与用户认知不一致的问题
+            display_paths = self.exe_product_index.get(low)
+            if display_paths:
+                return display_paths[0]
+            low += ".exe"
+        path = self.exe_index.get(low)
+        if path:
+            return path
+        return shutil.which(name) or shutil.which(low)
+
+    async def _launch_elevated(self, name: str, args: list[str], cwd: str | None) -> dict:
+        """用 ShellExecuteW(runas) 提权启动（会触发 C 端 UAC 弹窗）。"""
+        import ctypes
+
+        if not os.path.isfile(name):
+            name = self._resolve_exe(name) or name
+        params = " ".join(args)
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", name, params, cwd or None, 1
+        )
+        if rc > 32:
+            return {"ok": True, "launched": name, "elevated": True, "note": "ShellExecute runas"}
+        return {"ok": False, "error": f"提权启动失败 (code={rc})"}
+
+    async def _app_search(self, params: dict) -> dict:
+        """在 exe 索引中按名称模糊搜索应用。
+
+        同时匹配 exe 文件名与产品名/文件说明（显示名），返回 matched_on 字段
+        说明命中的索引类型（filename=文件名 / product=产品名或文件说明）。
+        """
+        query = (params.get("query") or "").lower().strip()
+        matches: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(name: str, path: str, matched_on: str, product: str | None = None) -> None:
+            if path.lower() in seen:
+                return
+            seen.add(path.lower())
+            item: dict = {"name": name, "path": path, "matched_on": matched_on}
+            if product:
+                item["product"] = product
+            matches.append(item)
+
+        # 1) 文件名匹配（原有行为）
+        for exe_name, exe_path in sorted(self.exe_index.items()):
+            if not query or query in exe_name:
+                _add(exe_name, exe_path, "filename")
+                if len(matches) >= 50:
+                    break
+        # 2) 产品名/文件说明匹配（用户认知的显示名）
+        if len(matches) < 50:
+            for alias, paths in sorted(self.exe_product_index.items()):
+                if query and query not in alias:
+                    continue
+                for p in paths:
+                    _add(os.path.basename(p), p, "product", product=alias)
+                    if len(matches) >= 50:
+                        break
+                if len(matches) >= 50:
+                    break
+        return {"count": len(matches), "query": query, "matches": matches}
+
+    async def _app_terminate(self, params: dict) -> dict:
+        pid = params.get("pid")
+        name = params.get("name")
+        terminated: list[int] = []
+        if pid is not None:
+            proc = psutil.Process(int(pid))
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except (psutil.TimeoutExpired, Exception):
+                proc.kill()
+            terminated.append(int(pid))
+        elif name:
+            target = name.lower()
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    pname = (proc.info.get("name") or "").lower()
+                except Exception:
+                    continue
+                if target in pname:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except (psutil.TimeoutExpired, Exception):
+                        proc.kill()
+                    terminated.append(proc.pid)
+        else:
+            raise ValueError("params.pid 或 params.name 必填")
+        return {"ok": True, "terminated": terminated}
+
+    # ---------- screenshot 方法 ----------
+
+    async def _exec_screenshot(self, params: dict) -> dict:
+        import io
+
+        from PIL import ImageGrab
+
+        # 截图复用：短时间内重复截图（如 remote_screenshot 后紧跟 remote_see）
+        # 直接返回上次结果，避免二次抓屏闪烁与耗时。reuse_seconds=0 时总是重新截图。
+        reuse = float(params.get("reuse_seconds", 0) or 0)
+        if reuse > 0 and self._last_shot is not None:
+            ts, cached = self._last_shot
+            if time.time() - ts <= reuse:
+                out = dict(cached)
+                out["reused"] = True
+                out["age"] = round(time.time() - ts, 2)
+                return out
+
+        try:
+            # all_screens=True：截取所有显示器组成的完整虚拟桌面，避免多屏时只截主屏
+            image = ImageGrab.grab(all_screens=True)
+        except Exception as e:
+            LOG.warning(f"direct grab failed (non-interactive session?): {e}")
+            return await self._screenshot_via_user_session()
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        raw = buf.getvalue()
+        # 多屏偏移：副屏可能在主屏左/上（负坐标），ImageGrab 像素原点=虚拟屏幕左上角。
+        # 视觉识别出的截图像素坐标 + offset 才是 SetCursorPos 需要的屏幕物理坐标。
+        ox, oy = gui.virtual_screen_offset() if gui else (0, 0)
+        result = {
+            "image": base64.b64encode(raw).decode("ascii"),
+            "format": "png",
+            "width": image.width,
+            "height": image.height,
+            "size": len(raw),
+            "offset_x": ox,
+            "offset_y": oy,
+            "reused": False,
+            "age": 0,
+        }
+        self._last_shot = (time.time(), result)
+        return result
+
+    # ---------- 键盘输入方法 ----------
+
+    async def _exec_input(self, params: dict) -> dict:
+        """向当前活动窗口输入文字。
+
+        params:
+            text: 要输入的文本（支持中文等 Unicode）。
+            mode: "type"（默认，SendInput Unicode 直输）/ "paste"（剪贴板+Ctrl+V 兜底）。
+            interval: 字符间隔秒数（type 模式，默认 0.01）。
+        """
+        text = params.get("text")
+        if not text or not isinstance(text, str):
+            raise ValueError("params.text 必填且为字符串")
+        if gui is None:
+            raise OSError("GUI 模块不可用（非 Windows 环境）")
+        mode = (params.get("mode") or "type").lower()
+        if mode == "paste":
+            gui.paste_text(text)
+        elif mode == "type":
+            gui.type_text(text, float(params.get("interval", 0.01)))
+        else:
+            raise ValueError(f"不支持的输入模式: {mode}（可选 type/paste）")
+        return {"ok": True, "mode": mode, "chars": len(text)}
+
+    async def _exec_keys(self, params: dict) -> dict:
+        """敲击按键或按键组合。
+
+        params:
+            keys: 按键名列表，如 ["ctrl", "c"]、["enter"]、["alt", "f4"]。
+                  支持：字母/数字/enter/tab/esc/space/backspace/delete/insert/
+                  home/end/pageup/pagedown/方向键/f1-f24/ctrl/shift/alt/win/
+                  num0-num9 等。
+        """
+        keys = params.get("keys")
+        if not keys or not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+            raise ValueError("params.keys 必填且为字符串列表")
+        if gui is None:
+            raise OSError("GUI 模块不可用（非 Windows 环境）")
+        gui.press_keys(keys)
+        return {"ok": True, "keys": list(keys)}
+
+    # ---------- 剪贴板 ----------
+
+    async def _exec_clipboard(self, params: dict) -> dict:
+        """读写系统剪贴板。
+
+        params:
+            action: "get"（读取文本）/ "set"（写入文本）。
+            text: set 时必填。
+        """
+        if gui is None:
+            raise OSError("GUI 模块不可用（非 Windows 环境）")
+        action = (params.get("action") or "get").lower()
+        if action == "get":
+            text = gui.get_clipboard_text()
+            return {"ok": True, "action": "get", "text": text, "length": len(text)}
+        if action == "set":
+            text = params.get("text")
+            if text is None or not isinstance(text, str):
+                raise ValueError("clipboard set 需要 params.text（字符串）")
+            gui.set_clipboard_text(text)
+            return {"ok": True, "action": "set", "length": len(text)}
+        raise ValueError(f"不支持的剪贴板动作: {action}（可选 get/set）")
+
+    # ---------- 鼠标控制方法 ----------
+
+    async def _exec_mouse(self, params: dict) -> dict:
+        """鼠标操作。坐标均为截图像素坐标（含多屏 offset 自动换算）。
+
+        params:
+            action: "click"（点击，默认）/ "move"（移动悬停）/
+                    "scroll"（滚轮）/ "drag"（拖拽）。
+            x, y: 目标坐标（click/move/scroll/drag 起点必填）。
+            x2, y2: drag 终点。
+            button: "left"/"right"/"middle"，默认 left。
+            clicks: 点击次数（双击传 2），默认 1。
+            dy: scroll 滚动格数，正数向上、负数向下。
+            steps: drag 插值步数，默认 10。
+            activate: 点击前若目标窗口不在前台则先激活（默认 true）。
+        """
+        if gui is None:
+            raise OSError("GUI 模块不可用（非 Windows 环境）")
+        action = (params.get("action") or "click").lower()
+        if action == "click":
+            if params.get("x") is None or params.get("y") is None:
+                raise ValueError("click 需要 x/y 坐标")
+            activated = gui.mouse_click(
+                int(params["x"]), int(params["y"]),
+                button=params.get("button", "left"),
+                clicks=int(params.get("clicks", 1)),
+                interval=float(params.get("interval", 0.05)),
+                activate=bool(params.get("activate", True)),
+            )
+            out = {"ok": True, "action": "click"}
+            if activated:
+                out["activated_window"] = activated
+            return out
+        elif action == "move":
+            if params.get("x") is None or params.get("y") is None:
+                raise ValueError("move 需要 x/y 坐标")
+            gui.mouse_move(int(params["x"]), int(params["y"]))
+        elif action == "scroll":
+            dy = int(params.get("dy", 0))
+            x = int(params["x"]) if params.get("x") is not None else None
+            y = int(params["y"]) if params.get("y") is not None else None
+            gui.mouse_scroll(dy, x, y)
+        elif action == "drag":
+            if params.get("x") is None or params.get("y") is None or params.get("x2") is None or params.get("y2") is None:
+                raise ValueError("drag 需要 x/y（起点）与 x2/y2（终点）")
+            gui.mouse_drag(
+                int(params["x"]), int(params["y"]),
+                int(params["x2"]), int(params["y2"]),
+                button=params.get("button", "left"),
+                steps=int(params.get("steps", 10)),
+                interval=float(params.get("interval", 0.01)),
+            )
+        else:
+            raise ValueError(f"不支持的鼠标动作: {action}（可选 click/move/scroll/drag）")
+        return {"ok": True, "action": action}
+
+    async def _screenshot_via_user_session(self) -> dict:
+        """Grab screen via a helper process launched in the interactive user session.
+
+        When this process runs in Session 0 (service session), PIL ImageGrab
+        cannot access the interactive desktop. Fall back to Task Scheduler:
+        run a tiny helper script as the interactive user (Session 1), write the
+        PNG to disk, then read it back.
+        """
+        import subprocess
+        import tempfile
+        import uuid
+
+        helper = os.path.join(tempfile.gettempdir(), f"cherry_shot_{uuid.uuid4().hex[:8]}.py")
+        out_png = os.path.join(tempfile.gettempdir(), f"cherry_shot_{uuid.uuid4().hex[:8]}.png")
+        task_name = None
+        helper_code = (
+            "from PIL import ImageGrab\n"
+            "import sys\n"
+            "ImageGrab.grab(all_screens=True).save(sys.argv[1], 'PNG')\n"
+        )
+        try:
+            with open(helper, "w", encoding="utf-8") as f:
+                f.write(helper_code)
+
+            username = self._find_active_user()
+            task_name = f"cherry_shot_{uuid.uuid4().hex[:8]}"
+            py_exe = self._find_python_exe()
+            cmd = f'"{py_exe}" "{helper}" "{out_png}"'
+
+            subprocess.run(
+                [
+                    "schtasks", "/create", "/tn", task_name, "/tr", cmd,
+                    "/sc", "once", "/st", "23:59", "/ru", username, "/it", "/f",
+                ],
+                capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["schtasks", "/run", "/tn", task_name],
+                capture_output=True, timeout=15,
+            )
+
+            # wait for output file (max 12s)
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                if os.path.isfile(out_png) and os.path.getsize(out_png) > 0:
+                    break
+                await asyncio.sleep(0.3)
+            if not os.path.isfile(out_png):
+                raise RuntimeError("helper screenshot produced no output file")
+
+            raw = Path(out_png).read_bytes()
+            from PIL import Image
+
+            w, h = Image.open(out_png).size
+            ox, oy = gui.virtual_screen_offset() if gui else (0, 0)
+            return {
+                "image": base64.b64encode(raw).decode("ascii"),
+                "format": "png",
+                "width": w,
+                "height": h,
+                "size": len(raw),
+                "offset_x": ox,
+                "offset_y": oy,
+            }
+        finally:
+            if task_name:
+                subprocess.run(
+                    ["schtasks", "/delete", "/tn", task_name, "/f"],
+                    capture_output=True, timeout=15,
+                )
+            for p in (helper, out_png):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _find_active_user() -> str:
+        """Return the username of the interactive (Session 1) user."""
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "(Get-CimInstance Win32_Process -Filter \"Name='explorer.exe'\").GetOwner().User",
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            user = (out.stdout or "").strip().splitlines()
+            if user:
+                return user[0].strip()
+        except Exception:
+            pass
+        return os.environ.get("USERNAME", "")
+
+    def _find_python_exe(self) -> str:
+        """Return a Python interpreter able to run the helper script.
+
+        Under PyInstaller, sys.executable is the exe itself and cannot run a
+        .py script; fall back to python/pythonw found on PATH.
+        """
+        import sys
+
+        exe = sys.executable or ""
+        if exe and not getattr(sys, "frozen", False):
+            return exe
+        for name in ("python.exe", "pythonw.exe", "py.exe"):
+            found = shutil.which(name)
+            if found:
+                return found
+        return "python"

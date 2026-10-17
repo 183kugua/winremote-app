@@ -1,0 +1,11 @@
+websockets>=12.0
+psutil>=5.9
+PyYAML>=6.0
+Pillow>=10.0
+
+# 桌面控制台（pywebview + HTML/CSS）。Windows 上会一并安装 pythonnet 用于
+# 调用系统 WebView2；仅用 --daemon 无界面部署时可不装。
+pywebview>=4.4
+
+# 系统托盘（常驻任务栏）
+pystray>=0.19
